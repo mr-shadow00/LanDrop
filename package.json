@@ -1,0 +1,17 @@
+{
+  "name": "landrop",
+  "version": "1.0.0",
+  "description": "LanDrop - a self-hosted, Snapdrop-style local network file drop, built to be more reliable with large files.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

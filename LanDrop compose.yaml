@@ -1,0 +1,14 @@
+services:
+  landrop:
+    image: node:20-alpine
+    container_name: landrop
+    restart: unless-stopped
+    working_dir: /app
+    command: ["sh", "-c", "[ -d node_modules ] || npm install --omit=dev --no-audit --no-fund; node server/index.js"]
+    ports:
+      - "8091:3000"
+    volumes:
+      - /DATA/AppData/landrop/app:/app
+    environment:
+      - PORT=3000
+      - TZ=your-time-zone
