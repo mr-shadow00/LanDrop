@@ -3,17 +3,14 @@
 // LanDrop client. Structure:
 //   1. Signaling socket   - talk to our server, discover peers
 //   2. Peer field UI      - draw peers in orbit around "You", handle clicks/drag&drop
-//   3. Transfer engine    - one RTCPeerConnection + one reliable DataChannel per peer,
-//                           chunked sends with backpressure, receiver reassembly
+//   3. Transfer engine    - offer/accept over WebSocket, then plain HTTP upload
+//                           (sender -> server) and download (server -> receiver).
+//                           No WebRTC, so it works across NetBird / VPNs.
 //   4. Toasts             - progress / done / error notices
 
 (() => {
   'use strict';
 
-  const CHUNK_SIZE = 64 * 1024;           // 64KB per chunk — safe across browsers
-  const BUFFERED_AMOUNT_HIGH = 8 * 1024 * 1024;  // pause sending above 8MB queued
-  const BUFFERED_AMOUNT_LOW = 2 * 1024 * 1024;   // resume once queue drains below 2MB
-  const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 
   const els = {
     selfName: document.getElementById('self-name'),
@@ -32,7 +29,8 @@
   const state = {
     self: null,          // { id, name, type }
     peers: new Map(),    // id -> { id, name, type, os, browser, el, x, y }
-    connections: new Map(), // id -> ConnPeer
+    outgoing: new Map(),    // transferId -> { peerId, resolve, reject }
+    incoming: new Map(),    // transferId -> { toast, peerName }
     pendingSendTarget: null, // peer id awaiting file picker result
   };
 
@@ -102,10 +100,10 @@
       return;
     }
 
-    if (msg.type === 'signal') {
-      handleIncomingSignal(msg.sender, msg.data);
-      return;
-    }
+    if (msg.type === 'transfer-offer') return onTransferOffer(msg);
+    if (msg.type === 'transfer-response') return onTransferResponse(msg);
+    if (msg.type === 'transfer-ready') return onTransferReady(msg);
+    if (msg.type === 'transfer-failed') return onTransferFailed(msg);
   }
 
   // ---------------------------------------------------------------------
@@ -131,7 +129,7 @@
         const p = state.peers.get(id);
         if (p.el) p.el.remove();
         state.peers.delete(id);
-        closeConnection(id);
+        failTransfersFor(id);
       }
     }
 
@@ -370,372 +368,151 @@
   }
 
   // ---------------------------------------------------------------------
-  // Transfer engine
+  // Transfer engine (HTTP relay through the LanDrop server)
   // ---------------------------------------------------------------------
 
-  class ConnPeer {
-    constructor(peerId) {
-      this.peerId = peerId;
-      this.pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      this.dc = null;
-      this.sendQueue = [];       // queued { files } batches waiting for dc to open
-      this.receiving = null;     // { id, name, size, mime, chunks, received }
-      this.sendActive = false;
-      this.pendingAccepts = new Map(); // fileId -> { resolve, reject }
+  const newId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-xxxx`);
+  const peerName = (id) => state.peers.get(id)?.name || 'a device';
 
-      this.pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          sendSignal({ type: 'signal', target: peerId, data: { kind: 'candidate', candidate: e.candidate } });
-        }
-      };
-
-      this.pc.oniceconnectionstatechange = () => {
-        const st = this.pc.iceConnectionState;
-        if (st === 'failed') {
-          try { this.pc.restartIce(); } catch {}
-        }
-        if (st === 'closed' || st === 'disconnected') {
-          // leave cleanup to explicit close paths / peer-list updates
-        }
-      };
-
-      this.pc.ondatachannel = (e) => {
-        this.attachChannel(e.channel);
-      };
-    }
-
-    attachChannel(channel) {
-      this.dc = channel;
-      channel.binaryType = 'arraybuffer';
-      channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW;
-
-      channel.onopen = () => {
-        this.flushQueue();
-      };
-
-      channel.onmessage = (e) => this.handleMessage(e.data);
-
-      channel.onclose = () => {};
-      channel.onerror = () => {};
-    }
-
-    ensureChannel() {
-      if (!this.dc) {
-        const channel = this.pc.createDataChannel('landrop', { ordered: true });
-        this.attachChannel(channel);
-      }
-      return this.dc;
-    }
-
-    handleMessage(data) {
-      if (typeof data === 'string') {
-        let msg;
-        try { msg = JSON.parse(data); } catch { return; }
-
-        if (msg.type === 'file-start') {
-          this.handleIncomingFileRequest(msg);
-        } else if (msg.type === 'file-end') {
-          this.finishReceivingFile();
-        } else if (msg.type === 'file-accept') {
-          const pending = this.pendingAccepts.get(msg.id);
-          if (pending) {
-            this.pendingAccepts.delete(msg.id);
-            pending.resolve();
-          }
-        } else if (msg.type === 'file-decline') {
-          const pending = this.pendingAccepts.get(msg.id);
-          if (pending) {
-            this.pendingAccepts.delete(msg.id);
-            pending.reject(new Error('declined'));
-          }
-        }
-        return;
-      }
-
-      // Binary chunk
-      if (this.receiving) {
-        this.receiving.chunks.push(data);
-        this.receiving.received += data.byteLength;
-        if (this.receivingToast) {
-          const pct = Math.floor((this.receiving.received / this.receiving.size) * 100);
-          this.receivingToast.setProgress(pct);
-          const peerName = state.peers.get(this.peerId)?.name || 'a device';
-          this.receivingToast.setSub(`from ${peerName} — ${pct}%`);
-        }
-      }
-    }
-
-    async handleIncomingFileRequest(msg) {
-      const peerName = state.peers.get(this.peerId)?.name || 'a device';
-      const dc = this.dc;
-
-      const accepted = await createRequestToast({
-        title: `${peerName} wants to send a file`,
-        sub: `${msg.name} — ${formatBytes(msg.size)}`,
-        icon: ICON_RECEIVE,
-      });
-
-      // Peer may have disconnected while the prompt was up.
-      if (!dc || dc.readyState !== 'open') return;
-
-      if (!accepted) {
-        try { dc.send(JSON.stringify({ type: 'file-decline', id: msg.id })); } catch {}
-        return;
-      }
-
-      this.receiving = {
-        id: msg.id,
-        name: msg.name,
-        size: msg.size,
-        mime: msg.mime || 'application/octet-stream',
-        chunks: [],
-        received: 0,
-      };
-      try { dc.send(JSON.stringify({ type: 'file-accept', id: msg.id })); } catch {}
-
-      this.receivingToast = createToast({
-        title: `Receiving ${msg.name}`,
-        sub: `from ${peerName} — 0%`,
-        icon: ICON_RECEIVE,
-      });
-    }
-
-    finishReceivingFile() {
-      const r = this.receiving;
-      this.receiving = null;
-      if (!r) return;
-      const blob = new Blob(r.chunks, { type: r.mime });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = r.name;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 30000);
-
-      if (this.receivingToast) {
-        this.receivingToast.setProgress(100);
-        this.receivingToast.setSub('Saved to your downloads');
-        this.receivingToast.done();
-        this.receivingToast.dismissAfter(4000);
-        this.receivingToast = null;
-      }
-    }
-
-    async sendFiles(files) {
-      this.ensureChannel();
-      if (this.dc.readyState !== 'open') {
-        this.sendQueue.push(files);
-        return;
-      }
-      await this._sendFilesNow(files);
-    }
-
-    flushQueue() {
-      const queued = this.sendQueue.splice(0);
-      queued.forEach((files) => this._sendFilesNow(files));
-    }
-
-    async _sendFilesNow(files) {
-      const peerEl = state.peers.get(this.peerId)?.el;
-      if (peerEl) peerEl.classList.add('sending');
-      setLinkActive(this.peerId, true);
-
-      for (const file of files) {
-        const fileId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const toast = createToast({
-          title: `Sending ${file.name}`,
-          sub: `to ${state.peers.get(this.peerId)?.name || 'device'} — 0%`,
-          icon: ICON_SEND,
-        });
-
-        try {
-          await this.sendOneFile(file, fileId, toast);
-          toast.setProgress(100);
-          toast.setSub('Delivered');
-          toast.done();
-          toast.dismissAfter(3000);
-        } catch (err) {
-          if (err && err.message === 'declined') {
-            toast.error(`${state.peers.get(this.peerId)?.name || 'They'} declined the file`);
-          } else if (err && err.message === 'no response — request timed out') {
-            toast.error('No response — request timed out');
-          } else {
-            toast.error('Transfer failed — connection dropped');
-          }
-          toast.dismissAfter(6000);
-          break;
-        }
-      }
-
-      if (peerEl) peerEl.classList.remove('sending');
-      setLinkActive(this.peerId, false);
-    }
-
-    async sendOneFile(file, fileId, toast) {
-      const dc = this.dc;
-      if (!dc || dc.readyState !== 'open') throw new Error('channel not open');
-
-      dc.send(JSON.stringify({
-        type: 'file-start', id: fileId, name: file.name, size: file.size, mime: file.type,
-      }));
-
-      toast.setSub(`to ${state.peers.get(this.peerId)?.name || 'device'} — waiting for accept…`);
-
-      // Wait for the receiver to accept before sending any bytes.
-      await new Promise((resolve, reject) => {
-        const onClose = () => {
-          this.pendingAccepts.delete(fileId);
-          reject(new Error('closed'));
-        };
-        dc.addEventListener('close', onClose, { once: true });
-
-        const timer = setTimeout(() => {
-          this.pendingAccepts.delete(fileId);
-          dc.removeEventListener('close', onClose);
-          reject(new Error('no response — request timed out'));
-        }, REQUEST_TIMEOUT_MS + 5000); // a little longer than the receiver's own prompt timeout
-
-        this.pendingAccepts.set(fileId, {
-          resolve: () => {
-            clearTimeout(timer);
-            dc.removeEventListener('close', onClose);
-            resolve();
-          },
-          reject: (err) => {
-            clearTimeout(timer);
-            dc.removeEventListener('close', onClose);
-            reject(err);
-          },
-        });
-      });
-
-      return new Promise((resolve, reject) => {
-        let offset = 0;
-        const reader = file.stream ? file.stream().getReader() : null;
-
-        const onClose = () => reject(new Error('closed'));
-        dc.addEventListener('close', onClose, { once: true });
-
-        const sendNextSlice = () => {
-          if (offset >= file.size) {
-            try {
-              dc.send(JSON.stringify({ type: 'file-end', id: fileId }));
-            } catch (err) {
-              dc.removeEventListener('close', onClose);
-              return reject(err);
-            }
-            dc.removeEventListener('close', onClose);
-            return resolve();
-          }
-
-          if (dc.bufferedAmount > BUFFERED_AMOUNT_HIGH) {
-            dc.onbufferedamountlow = () => {
-              dc.onbufferedamountlow = null;
-              sendNextSlice();
-            };
-            return;
-          }
-
-          const slice = file.slice(offset, offset + CHUNK_SIZE);
-          slice.arrayBuffer().then((buf) => {
-            try {
-              dc.send(buf);
-            } catch (err) {
-              dc.removeEventListener('close', onClose);
-              return reject(err);
-            }
-            offset += buf.byteLength;
-            const pct = Math.floor((offset / file.size) * 100);
-            toast.setProgress(pct);
-            toast.setSub(`to ${state.peers.get(this.peerId)?.name || 'device'} — ${pct}%`);
-            // Yield back to the event loop so UI + incoming signals stay responsive.
-            setTimeout(sendNextSlice, 0);
-          }).catch((err) => {
-            dc.removeEventListener('close', onClose);
-            reject(err);
-          });
-        };
-
-        sendNextSlice();
-      });
-    }
-
-    close() {
-      for (const pending of this.pendingAccepts.values()) {
-        pending.reject(new Error('closed'));
-      }
-      this.pendingAccepts.clear();
-      try { this.dc && this.dc.close(); } catch {}
-      try { this.pc.close(); } catch {}
-    }
-  }
-
-  function getOrCreateConn(peerId) {
-    let conn = state.connections.get(peerId);
-    if (!conn) {
-      conn = new ConnPeer(peerId);
-      state.connections.set(peerId, conn);
-    }
-    return conn;
-  }
-
-  function closeConnection(peerId) {
-    const conn = state.connections.get(peerId);
-    if (conn) {
-      conn.close();
-      state.connections.delete(peerId);
-    }
-  }
+  // ----- sender side -----
 
   async function sendFilesTo(peerId, files) {
-    const conn = getOrCreateConn(peerId);
-    const needsOffer = !conn.dc && conn.pc.signalingState === 'stable' && !conn._offering;
+    const peerEl = state.peers.get(peerId)?.el;
+    if (peerEl) peerEl.classList.add('sending');
+    setLinkActive(peerId, true);
 
-    conn.sendFiles(files);
-
-    if (needsOffer) {
-      conn._offering = true;
+    for (const file of files) {
+      const toast = createToast({
+        title: `Sending ${file.name}`,
+        sub: `to ${peerName(peerId)} — waiting for accept…`,
+        icon: ICON_SEND,
+      });
       try {
-        conn.ensureChannel();
-        const offer = await conn.pc.createOffer();
-        await conn.pc.setLocalDescription(offer);
-        sendSignal({ type: 'signal', target: peerId, data: { kind: 'offer', sdp: offer } });
+        await sendOneFile(peerId, file, toast);
+        toast.setProgress(100);
+        toast.setSub('Delivered');
+        toast.done();
+        toast.dismissAfter(3000);
       } catch (err) {
-        console.error('offer failed', err);
-        conn._offering = false;
+        const m = err && err.message;
+        if (m === 'declined') toast.error(`${peerName(peerId)} declined the file`);
+        else if (m === 'timeout') toast.error('No response — request timed out');
+        else toast.error('Transfer failed — connection dropped');
+        toast.dismissAfter(6000);
+        break;
       }
+    }
+
+    if (peerEl) peerEl.classList.remove('sending');
+    setLinkActive(peerId, false);
+  }
+
+  async function sendOneFile(peerId, file, toast) {
+    const id = newId();
+
+    // 1. Ask the receiver; wait for accept/decline.
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        state.outgoing.delete(id);
+        reject(new Error('timeout'));
+      }, REQUEST_TIMEOUT_MS + 5000);
+      state.outgoing.set(id, {
+        peerId,
+        resolve: () => { clearTimeout(timer); resolve(); },
+        reject: (e) => { clearTimeout(timer); state.outgoing.delete(id); reject(e); },
+      });
+      sendSignal({
+        type: 'transfer-offer', target: peerId, id,
+        name: file.name, size: file.size, mime: file.type,
+      });
+    });
+
+    // 2. Upload the raw file over HTTP (streams from disk, shows progress).
+    try {
+      await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('PUT', `/api/upload/${id}?peer=${encodeURIComponent(state.self.id)}`);
+        xhr.upload.onprogress = (e) => {
+          if (!e.lengthComputable) return;
+          const pct = Math.floor((e.loaded / e.total) * 100);
+          toast.setProgress(pct);
+          toast.setSub(`to ${peerName(peerId)} — ${pct}%`);
+        };
+        xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error('upload failed')));
+        xhr.onerror = () => reject(new Error('upload failed'));
+        xhr.onabort = () => reject(new Error('upload failed'));
+        const o = state.outgoing.get(id);
+        if (o) o.xhr = xhr;
+        xhr.send(file);
+      });
+    } finally {
+      state.outgoing.delete(id);
     }
   }
 
-  async function handleIncomingSignal(senderId, data) {
-    if (!state.peers.has(senderId)) return; // stale peer, ignore
-    const conn = getOrCreateConn(senderId);
+  function onTransferResponse(msg) {
+    const o = state.outgoing.get(msg.id);
+    if (!o) return;
+    if (msg.accept) o.resolve();
+    else o.reject(new Error('declined'));
+  }
 
-    if (data.kind === 'offer') {
-      try {
-        await conn.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-        const answer = await conn.pc.createAnswer();
-        await conn.pc.setLocalDescription(answer);
-        sendSignal({ type: 'signal', target: senderId, data: { kind: 'answer', sdp: answer } });
-      } catch (err) {
-        console.error('answer failed', err);
-      }
-    } else if (data.kind === 'answer') {
-      try {
-        await conn.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
-      } catch (err) {
-        console.error('setRemoteDescription(answer) failed', err);
-      } finally {
-        conn._offering = false;
-      }
-    } else if (data.kind === 'candidate') {
-      try {
-        await conn.pc.addIceCandidate(data.candidate);
-      } catch (err) {
-        // Benign if it arrives after the connection already closed.
-      }
+  // ----- receiver side -----
+
+  async function onTransferOffer(msg) {
+    const name = peerName(msg.sender);
+    const accepted = await createRequestToast({
+      title: `${name} wants to send a file`,
+      sub: `${msg.name} — ${formatBytes(msg.size)}`,
+      icon: ICON_RECEIVE,
+    });
+    sendSignal({ type: 'transfer-response', id: msg.id, accept: accepted });
+    if (!accepted) return;
+
+    const toast = createToast({
+      title: `Receiving ${msg.name}`,
+      sub: `from ${name} — waiting for upload…`,
+      icon: ICON_RECEIVE,
+    });
+    state.incoming.set(msg.id, { toast, name: msg.name });
+  }
+
+  function onTransferReady(msg) {
+    const inc = state.incoming.get(msg.id);
+    if (!inc) return;
+    state.incoming.delete(msg.id);
+
+    // Let the browser stream the download straight to disk.
+    const a = document.createElement('a');
+    a.href = `/api/download/${msg.id}?peer=${encodeURIComponent(state.self.id)}`;
+    a.download = inc.name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    inc.toast.setProgress(100);
+    inc.toast.setSub('Saved to your downloads');
+    inc.toast.done();
+    inc.toast.dismissAfter(4000);
+  }
+
+  function onTransferFailed(msg) {
+    const o = state.outgoing.get(msg.id);
+    if (o) {
+      try { o.xhr && o.xhr.abort(); } catch {}
+      o.reject(new Error('failed'));
+    }
+    const inc = state.incoming.get(msg.id);
+    if (inc) {
+      state.incoming.delete(msg.id);
+      inc.toast.error('Transfer failed — sender disconnected');
+      inc.toast.dismissAfter(6000);
+    }
+  }
+
+  function failTransfersFor(peerId) {
+    for (const [id, o] of state.outgoing) {
+      if (o.peerId === peerId) onTransferFailed({ id });
     }
   }
 

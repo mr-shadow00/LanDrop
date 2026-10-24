@@ -51,3 +51,11 @@ like a native app, no browser chrome.
   separate VLANs or behind isolated WiFi client networks with no route
   between them, WebRTC may not be able to establish a direct path — that's
   a network-topology limit, not something the app can route around.
+
+## Transfer method (changed)
+
+Files no longer use WebRTC. The sender offers the file over the WebSocket, the receiver
+accepts, the sender uploads over HTTP to `/api/upload/:id`, and the receiver downloads from
+`/api/download/:id`. Files sit in the server's temp dir only until downloaded (or 30 min).
+Works over NetBird, any VPN, or plain LAN — both devices just need to open the server's address
+(e.g. `http://<netbird-ip>:8091`). Optional env var: `MAX_FILE_BYTES` (0 = unlimited).
